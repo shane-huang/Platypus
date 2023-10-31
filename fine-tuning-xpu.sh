@@ -3,7 +3,7 @@ source /opt/intel/oneapi/setvars.sh
 export USE_XETLA=OFF
 export SYCL_PI_LEVEL_ZERO_USE_IMMEDIATE_COMMANDLISTS=1
 
-python finetune.py \
+python finetune-xpu.py \
     --base_model /mnt/disk1/models/Llama-2-7b-chat-hf \
     --data-path garage-bAInd/Open-Platypus \
     --output_dir ./llama2-platypus-7b \
