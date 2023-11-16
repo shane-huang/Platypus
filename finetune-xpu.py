@@ -235,9 +235,10 @@ def train(
 
     model = get_peft_model(model, config)
 
-    model.print_trainable_parameters()
+    from utils.debug import caculate_model_size, print_trainable_parameters
 
-    from utils.debug import caculate_model_size
+    print_trainable_parameters(model)
+    
     caculate_model_size(model)
 
     if data_path.endswith(".json") or data_path.endswith(".jsonl"):
