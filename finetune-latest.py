@@ -163,6 +163,7 @@ def train(
         )
     )
 
+
     # model = transformers.AutoModelForCausalLM.from_pretrained(
     #     base_model,
     #     torch_dtype=torch.bfloat16,
@@ -273,6 +274,9 @@ def train(
 
     model.print_trainable_parameters()
 
+    from utils.debug import caculate_model_size
+    caculate_model_size(model)
+
     if val_set_size > 0:
         train_val = data["train"].train_test_split(
             test_size=val_set_size, shuffle=True, seed=42
@@ -337,7 +341,7 @@ def train(
     pytorch_model_path = os.path.join(output_dir, "pytorch_model.bin")
     torch.save({}, pytorch_model_path)
     tokenizer.save_pretrained(output_dir)
-
+    
 
 if __name__ == "__main__":
     torch.cuda.empty_cache() 

@@ -242,6 +242,9 @@ def train(
 
     model.print_trainable_parameters()
 
+    from utils.debug import caculate_model_size
+    caculate_model_size(model)
+
     if val_set_size > 0:
         train_val = data["train"].train_test_split(
             test_size=val_set_size, shuffle=True, seed=42

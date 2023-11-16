@@ -235,6 +235,11 @@ def train(
 
     model = get_peft_model(model, config)
 
+    model.print_trainable_parameters()
+
+    from utils.debug import caculate_model_size
+    caculate_model_size(model)
+
     if data_path.endswith(".json") or data_path.endswith(".jsonl"):
         data = load_dataset("json", data_files=data_path)
     else:
