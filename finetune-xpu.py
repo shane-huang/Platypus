@@ -60,112 +60,7 @@ class LoadBestPeftModelCallback(TrainerCallback):
         return control
 
 
-def train(
-    # model/data params
-    base_model: str = "", 
-    data_path: str = "",
-    output_dir: str = "",
-    # training hyperparams
-    batch_size: int = 128,
-    micro_batch_size: int = 2,
-    num_epochs: int = 1,
-    learning_rate: float = 3e-4,
-    cutoff_len: int = 4096,
-    val_set_size: int = 0,
-    lr_scheduler: str = "cosine",
-    warmup_steps: int = 100, 
-    # lora hyperparams
-    lora_r: int = 16,
-    lora_alpha: int = 16,
-    lora_dropout: float = 0.05,
-    # from peft docs: ["q_proj", "k_proj", "v_proj", "o_proj", "fc_in", "fc_out", "wte", "gate_proj", "down_proj", "up_proj"]
-    lora_target_modules: List[str] = ["gate_proj", "down_proj", "up_proj"],
-    # llm hyperparams
-    train_on_inputs: bool = False,  # if False, masks out inputs in loss
-    add_eos_token: bool = False,
-    group_by_length: bool = False,  # faster, but produces an odd training loss curve
-    # wandb params
-    wandb_project: str = "",
-    wandb_run_name: str = "",
-    wandb_watch: str = "",  # options: false | gradients | all
-    wandb_log_model: str = "",  # options: false | true
-    resume_from_checkpoint: str = None,  # either training checkpoint or final adapter
-    prompt_template_name: str = "alpaca",
-    gradient_checkpointing: bool = False,
-):
-    if int(os.environ.get("LOCAL_RANK", 0)) == 0:
-        print(
-            f"Params using prompt template {prompt_template_name}:\n"
-            f"base_model: {base_model}\n"
-            f"data_path: {data_path}\n"
-            f"output_dir: {output_dir}\n"
-            f"batch_size: {batch_size}\n"
-            f"micro_batch_size: {micro_batch_size}\n"
-            f"num_epochs: {num_epochs}\n"
-            f"learning_rate: {learning_rate}\n"
-            f"cutoff_len: {cutoff_len}\n"
-            f"val_set_size: {val_set_size}\n"
-            f"lr_scheduler: {lr_scheduler}\n"
-            f"warmup_steps: {warmup_steps}\n"
-            f"lora_r: {lora_r}\n"
-            f"lora_alpha: {lora_alpha}\n"
-            f"lora_dropout: {lora_dropout}\n"
-            f"lora_target_modules: {lora_target_modules}\n"
-            f"train_on_inputs: {train_on_inputs}\n"
-            f"add_eos_token: {add_eos_token}\n"
-            f"group_by_length: {group_by_length}\n"
-            f"wandb_project: {wandb_project}\n"
-            f"wandb_run_name: {wandb_run_name}\n"
-            f"wandb_watch: {wandb_watch}\n"
-            f"wandb_log_model: {wandb_log_model}\n"
-            f"resume_from_checkpoint: {resume_from_checkpoint or False}\n"
-        )
-    assert (
-        base_model
-    ), "Please specify a --base_model, e.g. --base_model='huggyllama/llama-7b'"
-    gradient_accumulation_steps = batch_size // micro_batch_size
-
-    prompter = Prompter(prompt_template_name)
-
-    device_map = "auto"
-    world_size = int(os.environ.get("WORLD_SIZE", 1))
-    ddp = world_size != 1
-    if ddp:
-        device_map = {"": int(os.environ.get("LOCAL_RANK") or 0)}
-        gradient_accumulation_steps = gradient_accumulation_steps // world_size
-        print("gradient_accumulation_steps: ", gradient_accumulation_steps)
-
-    # Check if parameter passed or if set within environ
-    use_wandb = len(wandb_project) > 0 or (
-        "WANDB_PROJECT" in os.environ and len(os.environ["WANDB_PROJECT"]) > 0
-    )
-    # Only overwrite environ if wandb param passed
-    if len(wandb_project) > 0:
-        os.environ["WANDB_PROJECT"] = wandb_project
-    if len(wandb_watch) > 0:
-        os.environ["WANDB_WATCH"] = wandb_watch
-    if len(wandb_log_model) > 0:
-        os.environ["WANDB_LOG_MODEL"] = wandb_log_model
-
-    # model = AutoModelForCausalLM.from_pretrained(
-    #     base_model,
-    #     load_in_8bit=True,
-    #     torch_dtype=torch.float16,
-    #     device_map=device_map)
-
-    model = AutoModelForCausalLM.from_pretrained(
-        base_model,
-        load_in_low_bit="nf4",
-        # load_in_4bit=True,
-        optimize_model=False,
-        torch_dtype=torch.bfloat16,
-        # device_map=device_map,
-        modules_to_not_convert=["lm_head"],
-    )
-    print(f"Model loaded on rank {os.environ.get('LOCAL_RANK')}")
-    model = model.to(f'xpu:{os.environ.get("LOCAL_RANK", 0)}')
-    print(f"Model moved to rank {os.environ.get('LOCAL_RANK')}")
-
+def load_tokenizer(base_model):
     tokenizer = LlamaTokenizer.from_pretrained(base_model)
     
     bos = tokenizer.bos_token_id
@@ -175,7 +70,22 @@ def train(
 
     tokenizer.pad_token_id = 0  # unk. we want this to be different from the eos token
     tokenizer.padding_side = "right"
+    return tokenizer
 
+def load_data(data_path,
+              tokenizer,
+              cutoff_len,
+              prompt_template_name='alpaca', 
+              train_on_inputs=False, 
+              add_eos_token=False, 
+              val_set_size=0):
+    prompter = Prompter(prompt_template_name)
+        
+    if data_path.endswith(".json") or data_path.endswith(".jsonl"):
+        data = load_dataset("json", data_files=data_path)
+    else:
+        data = load_dataset(data_path)
+        
     def tokenize(prompt, add_eos_token=True):
         result = tokenizer(
             prompt,
@@ -221,9 +131,161 @@ def train(
                 user_prompt_len:
             ]  # TODO: Speed up?
         return tokenized_full_prompt
+    
+    if val_set_size > 0:
+        train_val = data["train"].train_test_split(
+            test_size=val_set_size, shuffle=True, seed=42
+        )
+        train_data = (
+            train_val["train"].shuffle(seed=42).map(generate_and_tokenize_prompt)
+        )
+        val_data = (
+            train_val["test"].shuffle(seed=42).map(generate_and_tokenize_prompt)
+        )
+    else:
+        train_data = data["train"].shuffle(seed=42).map(generate_and_tokenize_prompt)
+        val_data = None
+    
+    return train_data, val_data
+
+
+def select_samples_by_len(dataset, min_length, max_length):
+    def length_filter(sample, min_length, max_length):
+        return min_length <= len(sample['input_ids']) <= max_length
+
+    filtered_dataset = dataset.filter(lambda sample: length_filter(sample, min_length, max_length))
+    return filtered_dataset
+    
+    
+def train(
+    # model/data params
+    base_model: str = "", 
+    data_path: str = "",
+    output_dir: str = "",
+    # training hyperparams
+    batch_size: int = 128,
+    micro_batch_size: int = 2,
+    num_epochs: int = 1,
+    learning_rate: float = 3e-4,
+    cutoff_len: int = 4096,
+    val_set_size: int = 0,
+    lr_scheduler: str = "cosine",
+    warmup_steps: int = 100, 
+    # lora hyperparams
+    lora_r: int = 16,
+    lora_alpha: int = 16,
+    lora_dropout: float = 0.05,
+    # from peft docs: ["q_proj", "k_proj", "v_proj", "o_proj", "fc_in", "fc_out", "wte", "gate_proj", "down_proj", "up_proj"]
+    lora_target_modules: List[str] = ["gate_proj", "down_proj", "up_proj"],
+    # llm hyperparams
+    train_on_inputs: bool = False,  # if False, masks out inputs in loss
+    add_eos_token: bool = False,
+    group_by_length: bool = False,  # faster, but produces an odd training loss curve
+    # wandb params
+    wandb_project: str = "",
+    wandb_run_name: str = "",
+    wandb_watch: str = "",  # options: false | gradients | all
+    wandb_log_model: str = "",  # options: false | true
+    resume_from_checkpoint: str = None,  # either training checkpoint or final adapter
+    prompt_template_name: str = "alpaca",
+    gradient_checkpointing: bool = False,
+    seq_min: int = 0,
+    seq_max: int = 4096,
+):
+    if int(os.environ.get("LOCAL_RANK", 0)) == 0:
+        print(
+            f"Params using prompt template {prompt_template_name}:\n"
+            f"base_model: {base_model}\n"
+            f"data_path: {data_path}\n"
+            f"output_dir: {output_dir}\n"
+            f"batch_size: {batch_size}\n"
+            f"micro_batch_size: {micro_batch_size}\n"
+            f"num_epochs: {num_epochs}\n"
+            f"learning_rate: {learning_rate}\n"
+            f"cutoff_len: {cutoff_len}\n"
+            f"val_set_size: {val_set_size}\n"
+            f"lr_scheduler: {lr_scheduler}\n"
+            f"warmup_steps: {warmup_steps}\n"
+            f"gradient_checkpointing: {gradient_checkpointing}\n"
+            f"lora_r: {lora_r}\n"
+            f"lora_alpha: {lora_alpha}\n"
+            f"lora_dropout: {lora_dropout}\n"
+            f"lora_target_modules: {lora_target_modules}\n"
+            f"train_on_inputs: {train_on_inputs}\n"
+            f"add_eos_token: {add_eos_token}\n"
+            f"group_by_length: {group_by_length}\n"
+            f"wandb_project: {wandb_project}\n"
+            f"wandb_run_name: {wandb_run_name}\n"
+            f"wandb_watch: {wandb_watch}\n"
+            f"wandb_log_model: {wandb_log_model}\n"
+            f"resume_from_checkpoint: {resume_from_checkpoint or False}\n"
+            f"seq_min: {seq_min}\n"
+            f"seq_max: {seq_max}\n"
+            
+        )
+    assert (
+        base_model
+    ), "Please specify a --base_model, e.g. --base_model='huggyllama/llama-7b'"
+    gradient_accumulation_steps = batch_size // micro_batch_size
+
+    device_map = "auto"
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    ddp = world_size != 1
+    if ddp:
+        device_map = {"": int(os.environ.get("LOCAL_RANK") or 0)}
+        gradient_accumulation_steps = gradient_accumulation_steps // world_size
+        print("gradient_accumulation_steps: ", gradient_accumulation_steps)
+
+    # Check if parameter passed or if set within environ
+    use_wandb = len(wandb_project) > 0 or (
+        "WANDB_PROJECT" in os.environ and len(os.environ["WANDB_PROJECT"]) > 0
+    )
+    # Only overwrite environ if wandb param passed
+    if len(wandb_project) > 0:
+        os.environ["WANDB_PROJECT"] = wandb_project
+    if len(wandb_watch) > 0:
+        os.environ["WANDB_WATCH"] = wandb_watch
+    if len(wandb_log_model) > 0:
+        os.environ["WANDB_LOG_MODEL"] = wandb_log_model
+
+
+    tokenizer = load_tokenizer(base_model)
+    train_data, val_data = load_data(data_path, tokenizer, cutoff_len, 
+                                     prompt_template_name, train_on_inputs, add_eos_token, val_set_size)    
+        
+    train_data = select_samples_by_len(train_data,seq_min,seq_max)
+    
+    # import pickle
+    # with open('train_data.pkl', 'wb') as file:
+    #     pickle.dump(train_data, file)
+    # model = AutoModelForCausalLM.from_pretrained(
+    #     base_model,
+    #     load_in_8bit=True,
+    #     torch_dtype=torch.float16,
+    #     device_map=device_map)
+
+    model = AutoModelForCausalLM.from_pretrained(
+        base_model,
+        load_in_low_bit="nf4",
+        # load_in_4bit=True,
+        optimize_model=False,
+        torch_dtype=torch.bfloat16,
+        # device_map=device_map,
+        modules_to_not_convert=["lm_head"],
+    )
+    print(f"Model loaded on rank {os.environ.get('LOCAL_RANK')}")
+    model = model.to(f'xpu:{os.environ.get("LOCAL_RANK", 0)}')
+    print(f"Model moved to rank {os.environ.get('LOCAL_RANK')}")
+
+
 
     # model = prepare_model_for_int8_training(model)
-    model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=gradient_checkpointing)
+    # model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=gradient_checkpointing)
+    if gradient_checkpointing:
+        model.gradient_checkpointing_enable()
+    
+    model = prepare_model_for_kbit_training(model,use_gradient_checkpointing=gradient_checkpointing)
+        
 
     config = LoraConfig(
         r=lora_r,
@@ -240,11 +302,6 @@ def train(
     print_trainable_parameters(model)
 
     caculate_model_size(model)
-
-    if data_path.endswith(".json") or data_path.endswith(".jsonl"):
-        data = load_dataset("json", data_files=data_path)
-    else:
-        data = load_dataset(data_path)
 
     if resume_from_checkpoint:
         # Check the available weights and load them
@@ -268,25 +325,13 @@ def train(
 
     # model.print_trainable_parameters()
 
-    if val_set_size > 0:
-        train_val = data["train"].train_test_split(
-            test_size=val_set_size, shuffle=True, seed=42
-        )
-        train_data = (
-            train_val["train"].shuffle(seed=42).map(generate_and_tokenize_prompt)
-        )
-        val_data = (
-            train_val["test"].shuffle(seed=42).map(generate_and_tokenize_prompt)
-        )
-    else:
-        train_data = data["train"].shuffle(seed=42).map(generate_and_tokenize_prompt)
-        val_data = None
-
     if not ddp and torch.cuda.device_count() > 1:
         # keeps Trainer from trying its own DataParallelism when more than 1 gpu is available
         model.is_parallelizable = True
         model.model_parallel = True
 
+    print(model)
+    
     trainer = transformers.Trainer(
         model=model,
         train_dataset=train_data,
