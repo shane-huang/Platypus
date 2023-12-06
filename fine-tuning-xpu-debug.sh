@@ -2,9 +2,7 @@
 source /opt/intel/oneapi/setvars.sh
 export USE_XETLA=OFF
 export SYCL_PI_LEVEL_ZERO_USE_IMMEDIATE_COMMANDLISTS=1
-# export WANDB_MODE=disabled
-
-echo "Run starts at: $(date '+%Y-%m-%d %H:%M:%S')"
+export WANDB_MODE=disabled
 
 python finetune-xpu.py \
     --base_model /mnt/disk1/models/Llama-2-7b-chat-hf \
@@ -14,19 +12,18 @@ python finetune-xpu.py \
     --micro_batch_size 1 \
     --num_epochs 1 \
     --learning_rate 0.0004 \
-    --cutoff_len 3100 \
+    --cutoff_len 512 \
     --val_set_size 0 \
     --lora_r 16 \
     --lora_alpha 16 \
     --lora_dropout 0.05 \
     --lora_target_modules '[gate_proj, down_proj, up_proj]' \
     --train_on_inputs False \
-    --gradient_checkpointing True \
     --add_eos_token False \
     --group_by_length False \
     --prompt_template_name alpaca \
-    --lr_scheduler 'cosine' \
-    --warmup_steps 100
-
-echo "Run ends at: $(date '+%Y-%m-%d %H:%M:%S')"
-
+    --debug True \
+    --seq_min 511 \
+    --seq_max 513 \
+    --lr_scheduler 'cosine' 
+    #--warmup_steps 100

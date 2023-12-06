@@ -22,8 +22,8 @@ from transformers import LlamaForCausalLM, LlamaTokenizer
 from bigdl.llm.transformers import AutoModelForCausalLM
 
 import intel_extension_for_pytorch as ipex
-from bigdl.llm.transformers.qlora import get_peft_model, prepare_model_for_kbit_training
-
+from bigdl.llm.transformers.qlora import get_peft_model, prepare_model_for_kbit_training, LoraLowBitLinear
+from bigdl.llm.transformers.low_bit_linear import LowBitLinear
 from utils.prompter import Prompter
 
 
@@ -156,6 +156,26 @@ def select_samples_by_len(dataset, min_length, max_length):
     filtered_dataset = dataset.filter(lambda sample: length_filter(sample, min_length, max_length))
     return filtered_dataset
     
+
+def forward_hook_fn(module, input, output):
+    # Calculate the memory size of the output activation
+    # Assuming the output is a torch Tensor and using float32 (4 bytes per element)
+    batch_size, seq_length, feature_size = output.size()
+    memory_size = batch_size * seq_length * feature_size * 4  # in bytes
+    print(f"Act.Mem Profile: Layer: {module.__class__.__name__}, Output Size: {output.size()}, Memory: {memory_size} bytes, \
+          Output Data Type: {output.dtype}")
+
+def pack_hook(tensor):
+    tensor_size = tensor.nelement() * tensor.element_size()
+    print(f"Saving tensor of size: {tensor_size} bytes")
+    # return tensor  # You can return a handle for the unpack hook
+    return None
+
+def unpack_hook(tensor):
+    if tensor is not None:
+        tensor_size = tensor.nelement() * tensor.element_size()
+        print(f"Unpacking tensor of size: {tensor_size} bytes")
+    return tensor
     
 def train(
     # model/data params
@@ -191,6 +211,7 @@ def train(
     gradient_checkpointing: bool = False,
     seq_min: int = 0,
     seq_max: int = 4096,
+    debug: bool = False,
 ):
     if int(os.environ.get("LOCAL_RANK", 0)) == 0:
         print(
@@ -221,6 +242,7 @@ def train(
             f"resume_from_checkpoint: {resume_from_checkpoint or False}\n"
             f"seq_min: {seq_min}\n"
             f"seq_max: {seq_max}\n"
+            f"debug: {debug}\n"
             
         )
     assert (
@@ -277,8 +299,7 @@ def train(
     model = model.to(f'xpu:{os.environ.get("LOCAL_RANK", 0)}')
     print(f"Model moved to rank {os.environ.get('LOCAL_RANK')}")
 
-
-
+        
     # model = prepare_model_for_int8_training(model)
     # model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=gradient_checkpointing)
     if gradient_checkpointing:
@@ -302,6 +323,8 @@ def train(
     print_trainable_parameters(model)
 
     caculate_model_size(model)
+    
+    
 
     if resume_from_checkpoint:
         # Check the available weights and load them
@@ -332,6 +355,29 @@ def train(
 
     print(model)
     
+    
+    ################## debug ################
+    
+    if debug:
+
+    
+        for layer in model.modules(): 
+            # if isinstance(layer, (torch.nn.MultiheadAttention, torch.nn.Linear)):
+            if isinstance(layer, (LowBitLinear, torch.nn.Linear)):
+                print(f"registering hook to {layer.__class__.__name__}")
+                layer.register_forward_hook(forward_hook_fn)
+          
+              
+        # batch_size=1
+        # seq_len = 512
+        # input_ids = torch.randint(0, model.config.vocab_size, (batch_size, seq_len)).to('xpu:0')  # Example input
+        # # # with torch.no_grad():
+        # # with torch.autograd.graph.saved_tensors_hooks(pack_hook, unpack_hook):
+        # #     output = model(input_ids)
+        # #     output.backward()
+        input("Before Train, Press Enter to continue...")
+    
+    ########################## training ###########################
     trainer = transformers.Trainer(
         model=model,
         train_dataset=train_data,
@@ -372,7 +418,8 @@ def train(
     # if torch.__version__ >= "2" and sys.platform != "win32":
     #     model = torch.compile(model)
 
-    trainer.train(resume_from_checkpoint=resume_from_checkpoint)
+    with torch.autograd.graph.saved_tensors_hooks(pack_hook, unpack_hook):
+        trainer.train(resume_from_checkpoint=resume_from_checkpoint)
 
     model.save_pretrained(output_dir)
     # model.base_model.save_pretrained(output_dir)
