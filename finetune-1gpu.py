@@ -7,7 +7,7 @@ import torch
 import transformers
 from datasets import load_dataset
 
-from transformers import TrainerCallback, TrainingArguments, TrainerState, TrainerControl
+from transformers import TrainerCallback, TrainingArguments, TrainerState, TrainerControl,BitsAndBytesConfig
 from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
 
 import bitsandbytes as bnb
@@ -16,6 +16,7 @@ from peft import (
     LoraConfig,
     get_peft_model,
     prepare_model_for_int8_training,
+    prepare_model_for_kbit_training,
     set_peft_model_state_dict
 )
 
@@ -174,6 +175,79 @@ def unpack_hook(tensor):
         print(f"Unpacking tensor of size: {tensor_size} bytes")
     return tensor
 
+
+def create_bnb_config(use_lora=True):
+    if use_lora:
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.bfloat16,
+        )
+    else:
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_use_double_quant=False,
+            bnb_4bit_quant_type="fp4",
+            bnb_4bit_compute_dtype=torch.bfloat16,
+        )
+
+    return bnb_config
+
+
+def create_peft_config(target_modules, lora_r, lora_alpha, lora_dropout):
+    return LoraConfig(
+        r=lora_r,
+        lora_alpha=lora_alpha,
+        target_modules=target_modules,
+        lora_dropout=lora_dropout,
+        bias="none",
+        task_type="CAUSAL_LM")
+    
+def resume_from_ckpt(resume_from_checkpoint, model):
+    # Check the available weights and load them
+    checkpoint_name = os.path.join(
+        resume_from_checkpoint, "pytorch_model.bin"
+    )  # Full checkpoint
+    if not os.path.exists(checkpoint_name):
+        checkpoint_name = os.path.join(
+            resume_from_checkpoint, "adapter_model.bin"
+        )  # only LoRA model - LoRA config above has to fit
+        resume_from_checkpoint = (
+            False  # So the trainer won't try loading its state
+        )
+    # The two files above have a different name depending on how they were saved, but are actually the same.
+    if os.path.exists(checkpoint_name):
+        print(f"Restarting from {checkpoint_name}")
+        adapters_weights = torch.load(checkpoint_name)
+        set_peft_model_state_dict(model, adapters_weights)
+    else:
+        print(f"Checkpoint {checkpoint_name} not found")
+          
+          
+def load_model(base_model, torch_dtype=torch.float16, quantization_config=None, device_map="auto"):
+    if quantization_config:
+        # n_gpus = torch.cuda.device_count()
+        # max_memory = f'{24564}MB'
+        model = LlamaForCausalLM.from_pretrained(
+            base_model,
+            quantization_config=quantization_config,
+            device_map=device_map, # dispatch efficiently the model on the available ressources
+            # max_memory = {i: max_memory for i in range(n_gpus)},
+            # torch_dtype= torch_dtype,
+            output_hidden_states=True,
+            low_cpu_mem_usage=True,
+        )
+    else:
+        model = LlamaForCausalLM.from_pretrained(
+            base_model,
+            load_in_8bit=True,
+            torch_dtype= torch_dtype, #torch.float16,
+            device_map=device_map)
+
+    return model
+
+          
 def train(
     # model/data params
     base_model: str = "", 
@@ -276,45 +350,16 @@ def train(
         
     train_data = select_samples_by_len(train_data,seq_min,seq_max)
     
-    model = LlamaForCausalLM.from_pretrained(
-        base_model,
-        load_in_8bit=True,
-        torch_dtype=torch.float16,
-        device_map=device_map)
+    bnb_config = create_bnb_config()
+    model = load_model(base_model, quantization_config=bnb_config,device_map=device_map)
 
+    model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=gradient_checkpointing)
 
-    model = prepare_model_for_int8_training(model, use_gradient_checkpointing=False)
-
-    config = LoraConfig(
-        r=lora_r,
-        lora_alpha=lora_alpha,
-        target_modules=lora_target_modules,
-        lora_dropout=lora_dropout,
-        bias="none",
-        task_type="CAUSAL_LM")
-
+    config = create_peft_config(lora_target_modules, lora_r, lora_alpha, lora_dropout)
     model = get_peft_model(model, config)
 
     if resume_from_checkpoint:
-        # Check the available weights and load them
-        checkpoint_name = os.path.join(
-            resume_from_checkpoint, "pytorch_model.bin"
-        )  # Full checkpoint
-        if not os.path.exists(checkpoint_name):
-            checkpoint_name = os.path.join(
-                resume_from_checkpoint, "adapter_model.bin"
-            )  # only LoRA model - LoRA config above has to fit
-            resume_from_checkpoint = (
-                False  # So the trainer won't try loading its state
-            )
-        # The two files above have a different name depending on how they were saved, but are actually the same.
-        if os.path.exists(checkpoint_name):
-            print(f"Restarting from {checkpoint_name}")
-            adapters_weights = torch.load(checkpoint_name)
-            set_peft_model_state_dict(model, adapters_weights)
-        else:
-            print(f"Checkpoint {checkpoint_name} not found")
-
+        resume_from_ckpt(resume_from_checkpoint, model)
     model.print_trainable_parameters()
 
     print(model)
@@ -357,8 +402,8 @@ def train(
             num_train_epochs=num_epochs,
             learning_rate=learning_rate,
             # dataloader_num_workers=16,
-            bf16=True,
-            #fp16=True,
+            # bf16=True,
+            fp16=True,
             logging_steps=1,
             optim="adamw_torch",
             evaluation_strategy="steps" if val_set_size > 0 else "no",
@@ -382,8 +427,8 @@ def train(
     )
     model.config.use_cache = False
 
-    # if torch.__version__ >= "2" and sys.platform != "win32":
-    #     model = torch.compile(model)
+    if torch.__version__ >= "2" and sys.platform != "win32":
+        model = torch.compile(model)
 
     if debug:
         with torch.autograd.graph.saved_tensors_hooks(pack_hook, unpack_hook):

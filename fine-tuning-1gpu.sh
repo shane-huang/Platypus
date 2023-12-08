@@ -1,6 +1,6 @@
-#export WANDB_MODE=disabled
+export WANDB_MODE=disabled
 
-torchrun --nproc_per_node=1 --master_port=1234 finetune-1gpu.py \
+CUDA_VISIBLE_DEVICES=0 finetune-1gpu.py \
     --base_model /home/arda/llm_models/Llama-2-7b-chat-hf \
     --data-path /home/arda/shane/Platypus/Open-Platypus \
     --output_dir ./llama2-platypus-7b \
@@ -8,7 +8,7 @@ torchrun --nproc_per_node=1 --master_port=1234 finetune-1gpu.py \
     --micro_batch_size 1 \
     --num_epochs 1 \
     --learning_rate 0.0004 \
-    --cutoff_len 4096 \
+    --cutoff_len 512 \
     --val_set_size 0 \
     --lora_r 16 \
     --lora_alpha 16 \
