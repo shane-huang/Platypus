@@ -1,6 +1,6 @@
 export WANDB_MODE=disabled
 
-torchrun --nproc_per_node=2 --master_port=1234 finetune.py \
+torchrun --nproc_per_node=1 --master_port=1234 finetune-1gpu.py \
     --base_model /home/arda/llm_models/Llama-2-7b-chat-hf \
     --data-path /home/arda/shane/Platypus/Open-Platypus \
     --output_dir ./llama2-platypus-7b \
@@ -19,4 +19,7 @@ torchrun --nproc_per_node=2 --master_port=1234 finetune.py \
     --group_by_length False \
     --prompt_template_name alpaca \
     --lr_scheduler 'cosine' \
+    --seq_min 511 \
+    --seq_max 513 \
+    --debug True \
     --warmup_steps 100
